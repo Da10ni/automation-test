@@ -8,6 +8,10 @@ on:
       - main
       - develop
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   validate-merge-rules:
     runs-on: ubuntu-latest
@@ -66,6 +70,8 @@ jobs:
             "feature")
               if [ "$TARGET_BRANCH" = "develop" ]; then
                 VALID_MERGE=true
+              elif [[ "$TARGET_BRANCH" =~ ^feature/ ]]; then
+                ERROR_MSG="Feature branches cannot be merged into other feature branches. Target: $TARGET_BRANCH"
               else
                 ERROR_MSG="Feature branches can only merge into 'develop'. Current target: $TARGET_BRANCH"
               fi
@@ -73,6 +79,8 @@ jobs:
             "release")
               if [ "$TARGET_BRANCH" = "main" ]; then
                 VALID_MERGE=true
+              elif [[ "$TARGET_BRANCH" =~ ^release/ ]]; then
+                ERROR_MSG="Release branches cannot be merged into other release branches. Target: $TARGET_BRANCH"
               else
                 ERROR_MSG="Release branches can only merge into 'main'. Current target: $TARGET_BRANCH"
               fi
@@ -95,32 +103,122 @@ jobs:
           echo "✅ Branch naming and merge rules validation passed"
           echo "branch_type=$BRANCH_TYPE" >> $GITHUB_OUTPUT
 
-      - name: Comment on PR if validation fails
+      - name: Print validation error
         if: failure()
-        uses: actions/github-script@v7
+        run: |
+          echo "Validation failed. Check workflow logs for details."
+          echo "Error: ${{ steps.validate.outputs.error }}"
+
+  code-quality:
+    name: ESLint Code Quality Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          script: |
-            const errorMsg = `${{ steps.validate.outputs.error }}`;
-            const comment = `## ❌ Merge Request Validation Failed
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --force
+
+      - name: Run ESLint 
+        id: eslint
+        run: |
+          echo "Running ESLint..."
+          set +e
+          npm run lint > eslint-output.txt 2>&1
+          ESLINT_EXIT_CODE=$?
+          set -e
+
+          echo "ESLint exit code: $ESLINT_EXIT_CODE"
+
+          if [ $ESLINT_EXIT_CODE -eq 0 ]; then
+            echo "eslint_status=Passed" >> $GITHUB_OUTPUT
+            echo "eslint_summary=No ESLint issues found" >> $GITHUB_OUTPUT
+          else
+            echo "eslint_status=Issues Found" >> $GITHUB_OUTPUT
+            ERRORS=$(grep -c "error" eslint-output.txt || echo "0")
+            WARNINGS=$(grep -c "warning" eslint-output.txt || echo "0")
+            PROBLEMS=$(grep -o "[0-9]\+ problems" eslint-output.txt | head -1 | grep -o "[0-9]\+" || echo "unknown")
             
-            **Error:** ${errorMsg}
-            
-            ### Branch Naming Rules:
-            - \`feature/*\` → for new features (can only merge into \`develop\`)
-            - \`release/*\` → for preparing production releases (can only merge into \`main\`)
-            - \`hotfix/*\` → for urgent fixes in production (can only merge into \`main\`)
-            
-            ### Protected Branches:
-            - \`main\` and \`develop\` are protected branches
-            
-            Please rename your branch or change the target branch according to the rules above.`;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+            if [ "$PROBLEMS" != "unknown" ]; then
+              echo "eslint_summary=Found $PROBLEMS problems ($ERRORS errors, $WARNINGS warnings)" >> $GITHUB_OUTPUT
+            else
+              echo "eslint_summary=Found $ERRORS errors and $WARNINGS warnings" >> $GITHUB_OUTPUT
+            fi
+          fi
+          exit 0
+        continue-on-error: true
+
+      - name: Upload ESLint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eslint-results
+          path: eslint-output.txt
+          retention-days: 7
+
+  sonarqube-analysis:
+    name: SonarQube Code Analysis 
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --force
+
+      - name: Run unit tests with coverage
+        id: coverage
+        run: |
+          echo "Running tests with coverage..."
+          npm run test:cov || true
+          echo "coverage_status=Completed" >> $GITHUB_OUTPUT
+          exit 0
+        continue-on-error: true
+
+      - name: SonarQube Scan
+        id: sonar_scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: http://194.163.40.149:9000
+        continue-on-error: true
+
+      - name: Check Quality Gate
+        id: quality_gate
+        run: |
+          echo "SonarQube analysis completed. Check the dashboard for quality gate status."
+          echo "Dashboard URL: http://194.163.40.149:9000"
+          echo "quality_gate_status=Check Dashboard" >> $GITHUB_OUTPUT
+          exit 0
+        continue-on-error: true
+
+      - name: Upload SonarQube results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-results
+          path: |
+            .scannerwork/
+            coverage/
+          retention-days: 7
+        continue-on-error: true
 
   auto-merge-after-release:
     runs-on: ubuntu-latest
@@ -135,11 +233,9 @@ jobs:
       - name: Check if merge came from release or hotfix branch
         id: check_merge
         run: |
-          # Get the commit message of the latest merge commit
           COMMIT_MSG=$(git log -1 --pretty=format:"%s")
           echo "Latest commit message: $COMMIT_MSG"
           
-          # Check if it's a merge from release or hotfix branch
           if [[ $COMMIT_MSG =~ "Merge pull request".+"release/" ]]; then
             echo "merge_type=release" >> $GITHUB_OUTPUT
             echo "Found merge from release branch"
@@ -157,19 +253,16 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # Checkout develop branch
           git checkout develop
           git pull origin develop
           
-          # Merge main into develop
           if git merge main --no-ff -m "Auto-merge: Sync develop with main after ${{ steps.check_merge.outputs.merge_type }} merge"; then
             git push origin develop
-            echo "✅ Successfully auto-merged main into develop"
+            echo "Successfully auto-merged main into develop"
           else
-            echo "❌ Merge conflict detected. Manual intervention required."
-            # Create an issue for manual resolution
+            echo "Merge conflict detected. Manual intervention required."
             gh issue create \
-              --title "🚨 Auto-merge failed: main → develop" \
+              --title "Auto-merge failed: main to develop" \
               --body "Auto-merge from main to develop failed due to conflicts after ${{ steps.check_merge.outputs.merge_type }} branch merge. Manual resolution required." \
               --label "merge-conflict" \
               --assignee "${{ github.actor }}"
@@ -180,7 +273,6 @@ jobs:
       - name: Auto-merge hotfix to active release branches
         if: steps.check_merge.outputs.merge_type == 'hotfix'
         run: |
-          # Find all active release branches
           RELEASE_BRANCHES=$(git branch -r | grep 'origin/release/' | sed 's/origin\///' | xargs)
           
           if [ -z "$RELEASE_BRANCHES" ]; then
@@ -197,11 +289,11 @@ jobs:
             
             if git merge main --no-ff -m "Auto-merge: Sync $branch with main after hotfix"; then
               git push origin "$branch"
-              echo "✅ Successfully auto-merged main into $branch"
+              echo "Successfully auto-merged main into $branch"
             else
-              echo "❌ Merge conflict in $branch. Creating issue for manual resolution."
+              echo "Merge conflict in $branch. Creating issue for manual resolution."
               gh issue create \
-                --title "🚨 Auto-merge failed: main → $branch" \
+                --title "Auto-merge failed: main to $branch" \
                 --body "Auto-merge from main to $branch failed due to conflicts after hotfix merge. Manual resolution required." \
                 --label "merge-conflict" \
                 --assignee "${{ github.actor }}"
