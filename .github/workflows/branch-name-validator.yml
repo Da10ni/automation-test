@@ -1,0 +1,46 @@
+name: Branch Name Validator
+
+on:
+  create:
+
+jobs:
+  validate-branch-name:
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          echo "Validating branch name: $BRANCH_NAME"
+          
+          if [[ ! $BRANCH_NAME =~ ^(feature|release|hotfix)/ ]]; then
+            echo "❌ Invalid branch name: $BRANCH_NAME"
+            echo "Branch must start with: feature/, release/, or hotfix/"
+            
+            # Delete the invalid branch
+            gh api repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME -X DELETE
+            
+            # Create an issue to notify about the invalid branch
+            gh issue create \
+              --title "🚨 Invalid Branch Name Detected: $BRANCH_NAME" \
+              --body "**Invalid branch name:** \`$BRANCH_NAME\`
+
+            **Branch naming rules:**
+            - \`feature/*\` → for new features
+            - \`release/*\` → for preparing production releases  
+            - \`hotfix/*\` → for urgent fixes in production
+
+            **Action taken:** Branch has been automatically deleted.
+
+            **Next steps:** Please create a new branch with proper naming convention.
+
+            **Created by:** @${{ github.actor }}" \
+              --label "invalid-branch" \
+              --assignee "${{ github.actor }}"
+            
+            exit 1
+          else
+            echo "✅ Branch name '$BRANCH_NAME' follows naming convention"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
