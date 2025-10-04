@@ -25,10 +25,10 @@ jobs:
         run: |
           SOURCE_BRANCH="${{ github.head_ref }}"
           TARGET_BRANCH="${{ github.base_ref }}"
-          
+
           echo "Source branch: $SOURCE_BRANCH"
           echo "Target branch: $TARGET_BRANCH"
-          
+
           # Function to check if branch matches pattern
           check_branch_pattern() {
             local branch=$1
@@ -39,11 +39,11 @@ jobs:
               return 1
             fi
           }
-          
+
           # Validate branch naming conventions
           VALID_BRANCH=false
           BRANCH_TYPE=""
-          
+
           if check_branch_pattern "$SOURCE_BRANCH" "feature/"; then
             VALID_BRANCH=true
             BRANCH_TYPE="feature"
@@ -54,18 +54,18 @@ jobs:
             VALID_BRANCH=true
             BRANCH_TYPE="hotfix"
           fi
-          
+
           if [ "$VALID_BRANCH" = false ]; then
             echo "❌ Invalid branch name: $SOURCE_BRANCH"
             echo "Branch must start with: feature/, release/, or hotfix/"
             echo "error=Invalid branch naming convention" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           # Validate merge rules based on branch type
           VALID_MERGE=false
           ERROR_MSG=""
-          
+
           case $BRANCH_TYPE in
             "feature")
               if [ "$TARGET_BRANCH" = "develop" ]; then
@@ -93,13 +93,13 @@ jobs:
               fi
               ;;
           esac
-          
+
           if [ "$VALID_MERGE" = false ]; then
             echo "❌ Invalid merge target: $ERROR_MSG"
             echo "error=$ERROR_MSG" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           echo "✅ Branch naming and merge rules validation passed"
           echo "branch_type=$BRANCH_TYPE" >> $GITHUB_OUTPUT
 
@@ -126,32 +126,39 @@ jobs:
       - name: Install dependencies
         run: npm ci --force
 
-      - name: Run ESLint 
+      - name: Run ESLint
         id: eslint
         run: |
-          echo "Running ESLint..."
+          echo "🔍 Running ESLint..."
           set +e
           npm run lint > eslint-output.txt 2>&1
           ESLINT_EXIT_CODE=$?
           set -e
 
           echo "ESLint exit code: $ESLINT_EXIT_CODE"
+          echo "----- ESLint Report (start) -----"
+          cat eslint-output.txt || true
+          echo "----- ESLint Report (end) -----"
 
           if [ $ESLINT_EXIT_CODE -eq 0 ]; then
+            echo "✅ No ESLint issues found"
             echo "eslint_status=Passed" >> $GITHUB_OUTPUT
             echo "eslint_summary=No ESLint issues found" >> $GITHUB_OUTPUT
           else
+            echo "⚠️ ESLint found issues"
             echo "eslint_status=Issues Found" >> $GITHUB_OUTPUT
             ERRORS=$(grep -c "error" eslint-output.txt || echo "0")
             WARNINGS=$(grep -c "warning" eslint-output.txt || echo "0")
             PROBLEMS=$(grep -o "[0-9]\+ problems" eslint-output.txt | head -1 | grep -o "[0-9]\+" || echo "unknown")
-            
+
             if [ "$PROBLEMS" != "unknown" ]; then
               echo "eslint_summary=Found $PROBLEMS problems ($ERRORS errors, $WARNINGS warnings)" >> $GITHUB_OUTPUT
             else
               echo "eslint_summary=Found $ERRORS errors and $WARNINGS warnings" >> $GITHUB_OUTPUT
             fi
           fi
+
+          # Always succeed, even if lint failed
           exit 0
         continue-on-error: true
 
@@ -164,7 +171,7 @@ jobs:
           retention-days: 7
 
   sonarqube-analysis:
-    name: SonarQube Code Analysis 
+    name: SonarQube Code Analysis
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
@@ -235,7 +242,7 @@ jobs:
         run: |
           COMMIT_MSG=$(git log -1 --pretty=format:"%s")
           echo "Latest commit message: $COMMIT_MSG"
-          
+
           if [[ $COMMIT_MSG =~ "Merge pull request".+"release/" ]]; then
             echo "merge_type=release" >> $GITHUB_OUTPUT
             echo "Found merge from release branch"
@@ -252,10 +259,10 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
+
           git checkout develop
           git pull origin develop
-          
+
           if git merge main --no-ff -m "Auto-merge: Sync develop with main after ${{ steps.check_merge.outputs.merge_type }} merge"; then
             git push origin develop
             echo "Successfully auto-merged main into develop"
@@ -274,14 +281,14 @@ jobs:
         if: steps.check_merge.outputs.merge_type == 'hotfix'
         run: |
           RELEASE_BRANCHES=$(git branch -r | grep 'origin/release/' | sed 's/origin\///' | xargs)
-          
+
           if [ -z "$RELEASE_BRANCHES" ]; then
             echo "No active release branches found"
             exit 0
           fi
-          
+
           echo "Found release branches: $RELEASE_BRANCHES"
-          
+
           for branch in $RELEASE_BRANCHES; do
             echo "Processing branch: $branch"
             git checkout "$branch"
