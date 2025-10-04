@@ -126,34 +126,42 @@ jobs:
       - name: Install dependencies
         run: npm ci --force
 
-      - name: Run ESLint 
+           - name: Run ESLint 
         id: eslint
         run: |
-          echo "Running ESLint..."
+          echo "🔍 Running ESLint..."
           set +e
           npm run lint > eslint-output.txt 2>&1
           ESLINT_EXIT_CODE=$?
           set -e
 
           echo "ESLint exit code: $ESLINT_EXIT_CODE"
+          echo "----- ESLint Report (start) -----"
+          cat eslint-output.txt || true
+          echo "----- ESLint Report (end) -----"
 
           if [ $ESLINT_EXIT_CODE -eq 0 ]; then
+            echo "✅ No ESLint issues found"
             echo "eslint_status=Passed" >> $GITHUB_OUTPUT
             echo "eslint_summary=No ESLint issues found" >> $GITHUB_OUTPUT
           else
+            echo "⚠️ ESLint found issues"
             echo "eslint_status=Issues Found" >> $GITHUB_OUTPUT
             ERRORS=$(grep -c "error" eslint-output.txt || echo "0")
             WARNINGS=$(grep -c "warning" eslint-output.txt || echo "0")
             PROBLEMS=$(grep -o "[0-9]\+ problems" eslint-output.txt | head -1 | grep -o "[0-9]\+" || echo "unknown")
-            
+
             if [ "$PROBLEMS" != "unknown" ]; then
               echo "eslint_summary=Found $PROBLEMS problems ($ERRORS errors, $WARNINGS warnings)" >> $GITHUB_OUTPUT
             else
               echo "eslint_summary=Found $ERRORS errors and $WARNINGS warnings" >> $GITHUB_OUTPUT
             fi
           fi
+
+          # Always succeed, even if lint failed
           exit 0
         continue-on-error: true
+
 
       - name: Upload ESLint results
         if: always()
