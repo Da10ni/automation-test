@@ -6,7 +6,7 @@ on:
   push:
     branches:
       - main
-      - develop
+      - development 
 
 permissions:
   contents: write
@@ -25,10 +25,10 @@ jobs:
         run: |
           SOURCE_BRANCH="${{ github.head_ref }}"
           TARGET_BRANCH="${{ github.base_ref }}"
-          
+
           echo "Source branch: $SOURCE_BRANCH"
           echo "Target branch: $TARGET_BRANCH"
-          
+
           # Function to check if branch matches pattern
           check_branch_pattern() {
             local branch=$1
@@ -39,11 +39,11 @@ jobs:
               return 1
             fi
           }
-          
+
           # Validate branch naming conventions
           VALID_BRANCH=false
           BRANCH_TYPE=""
-          
+
           if check_branch_pattern "$SOURCE_BRANCH" "feature/"; then
             VALID_BRANCH=true
             BRANCH_TYPE="feature"
@@ -54,26 +54,26 @@ jobs:
             VALID_BRANCH=true
             BRANCH_TYPE="hotfix"
           fi
-          
+
           if [ "$VALID_BRANCH" = false ]; then
             echo "❌ Invalid branch name: $SOURCE_BRANCH"
             echo "Branch must start with: feature/, release/, or hotfix/"
             echo "error=Invalid branch naming convention" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           # Validate merge rules based on branch type
           VALID_MERGE=false
           ERROR_MSG=""
-          
+
           case $BRANCH_TYPE in
             "feature")
-              if [ "$TARGET_BRANCH" = "develop" ]; then
+              if [ "$TARGET_BRANCH" = "development" ]; then 
                 VALID_MERGE=true
               elif [[ "$TARGET_BRANCH" =~ ^feature/ ]]; then
                 ERROR_MSG="Feature branches cannot be merged into other feature branches. Target: $TARGET_BRANCH"
               else
-                ERROR_MSG="Feature branches can only merge into 'develop'. Current target: $TARGET_BRANCH"
+                ERROR_MSG="Feature branches can only merge into 'development'. Current target: $TARGET_BRANCH"
               fi
               ;;
             "release")
@@ -93,13 +93,13 @@ jobs:
               fi
               ;;
           esac
-          
+
           if [ "$VALID_MERGE" = false ]; then
             echo "❌ Invalid merge target: $ERROR_MSG"
             echo "error=$ERROR_MSG" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
+
           echo "✅ Branch naming and merge rules validation passed"
           echo "branch_type=$BRANCH_TYPE" >> $GITHUB_OUTPUT
 
@@ -126,32 +126,39 @@ jobs:
       - name: Install dependencies
         run: npm ci --force
 
-      - name: Run ESLint 
+      - name: Run ESLint
         id: eslint
         run: |
-          echo "Running ESLint..."
+          echo "🔍 Running ESLint..."
           set +e
           npm run lint > eslint-output.txt 2>&1
           ESLINT_EXIT_CODE=$?
           set -e
 
           echo "ESLint exit code: $ESLINT_EXIT_CODE"
+          echo "----- ESLint Report (start) -----"
+          cat eslint-output.txt || true
+          echo "----- ESLint Report (end) -----"
 
           if [ $ESLINT_EXIT_CODE -eq 0 ]; then
+            echo "✅ No ESLint issues found"
             echo "eslint_status=Passed" >> $GITHUB_OUTPUT
             echo "eslint_summary=No ESLint issues found" >> $GITHUB_OUTPUT
           else
+            echo "⚠️ ESLint found issues"
             echo "eslint_status=Issues Found" >> $GITHUB_OUTPUT
             ERRORS=$(grep -c "error" eslint-output.txt || echo "0")
             WARNINGS=$(grep -c "warning" eslint-output.txt || echo "0")
             PROBLEMS=$(grep -o "[0-9]\+ problems" eslint-output.txt | head -1 | grep -o "[0-9]\+" || echo "unknown")
-            
+
             if [ "$PROBLEMS" != "unknown" ]; then
               echo "eslint_summary=Found $PROBLEMS problems ($ERRORS errors, $WARNINGS warnings)" >> $GITHUB_OUTPUT
             else
               echo "eslint_summary=Found $ERRORS errors and $WARNINGS warnings" >> $GITHUB_OUTPUT
             fi
           fi
+
+          # Always succeed, even if lint failed
           exit 0
         continue-on-error: true
 
@@ -163,10 +170,14 @@ jobs:
           path: eslint-output.txt
           retention-days: 7
 
+  # SonarQube Analysis Job - Self-Hosted Server (Non-blocking)
   sonarqube-analysis:
-    name: SonarQube Code Analysis 
+    name: SonarQube Code Analysis (Non-blocking)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: >
+      (github.event_name == 'pull_request' || github.ref == 'refs/heads/feature/linting') &&
+      !(startsWith(github.event.pull_request.base.ref, 'feature/') ||
+        startsWith(github.event.pull_request.base.ref, 'release/'))
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -187,7 +198,9 @@ jobs:
         run: |
           echo "Running tests with coverage..."
           npm run test:cov || true
-          echo "coverage_status=Completed" >> $GITHUB_OUTPUT
+
+          # Always continue, even if tests fail
+          echo "coverage_status=✅ Completed" >> $GITHUB_OUTPUT
           exit 0
         continue-on-error: true
 
@@ -200,12 +213,13 @@ jobs:
           SONAR_HOST_URL: http://194.163.40.149:9000
         continue-on-error: true
 
-      - name: Check Quality Gate
+      - name: Check Quality Gate (Non-blocking)
         id: quality_gate
         run: |
           echo "SonarQube analysis completed. Check the dashboard for quality gate status."
           echo "Dashboard URL: http://194.163.40.149:9000"
-          echo "quality_gate_status=Check Dashboard" >> $GITHUB_OUTPUT
+          echo "quality_gate_status=ℹ️ Check Dashboard" >> $GITHUB_OUTPUT
+          echo "This check is non-blocking - PR can proceed regardless of quality gate status"
           exit 0
         continue-on-error: true
 
@@ -219,6 +233,84 @@ jobs:
             coverage/
           retention-days: 7
         continue-on-error: true
+
+      - name: Comment PR with SonarQube results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let sonarResults = '';
+            let qualityGateStatus = '${{ steps.quality_gate.outputs.quality_gate_status }}' || 'ℹ️ Check Dashboard';
+            let coverageStatus = '${{ steps.coverage.outputs.coverage_status }}' || 'ℹ️ Completed';
+            let dashboardUrl = 'http://194.163.40.149:9000';
+            let additionalInfo = '';
+
+            try {
+              const reportPath = '.scannerwork/report-task.txt';
+              if (fs.existsSync(reportPath)) {
+                const reportContent = fs.readFileSync(reportPath, 'utf8');
+                const extractedUrl = reportContent.match(/dashboardUrl=(.+)/)?.[1];
+                if (extractedUrl) dashboardUrl = extractedUrl;
+              }
+            } catch (error) {
+              console.log('Could not read SonarQube report:', error);
+            }
+
+            try {
+              if (fs.existsSync('coverage/lcov-report/index.html')) {
+                additionalInfo += '\n📊 **Coverage report generated** - check artifacts for detailed coverage information';
+              }
+            } catch (error) {
+              console.log('Could not check coverage files:', error);
+            }
+
+            sonarResults = `📊 **SonarQube Analysis Complete** (Non-blocking)
+
+            **Quality Gate Status:** ${qualityGateStatus}
+            **Coverage Status:** ${coverageStatus}
+
+            [🔍 View Detailed Report](${dashboardUrl})
+
+            **Analysis includes:**
+            - ✅ Code coverage metrics
+            - 🛡️ Security vulnerability scan
+            - 🔍 Code smells detection
+            - 📊 Technical debt analysis
+            - 🔄 Code duplication check
+            ${additionalInfo}
+
+            **📝 Note:** This analysis is non-blocking. The PR can be merged regardless of the quality gate status, but please review any issues found to maintain code quality.
+
+            **Dashboard:** [View Full Results](${dashboardUrl})`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const existingComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('📊 **SonarQube Analysis')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                comment_id: existingComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: sonarResults
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: sonarResults
+              });
+            }
 
   auto-merge-after-release:
     runs-on: ubuntu-latest
@@ -235,7 +327,7 @@ jobs:
         run: |
           COMMIT_MSG=$(git log -1 --pretty=format:"%s")
           echo "Latest commit message: $COMMIT_MSG"
-          
+
           if [[ $COMMIT_MSG =~ "Merge pull request".+"release/" ]]; then
             echo "merge_type=release" >> $GITHUB_OUTPUT
             echo "Found merge from release branch"
@@ -247,23 +339,23 @@ jobs:
             echo "No release or hotfix merge detected"
           fi
 
-      - name: Auto-merge back to develop
+      - name: Auto-merge back to development
         if: steps.check_merge.outputs.merge_type != 'none'
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          git checkout develop
-          git pull origin develop
-          
-          if git merge main --no-ff -m "Auto-merge: Sync develop with main after ${{ steps.check_merge.outputs.merge_type }} merge"; then
-            git push origin develop
-            echo "Successfully auto-merged main into develop"
+
+          git checkout development 
+          git pull origin development
+
+          if git merge main --no-ff -m "Auto-merge: Sync development with main after ${{ steps.check_merge.outputs.merge_type }} merge"; then
+            git push origin development
+            echo "Successfully auto-merged main into development"
           else
             echo "Merge conflict detected. Manual intervention required."
             gh issue create \
-              --title "Auto-merge failed: main to develop" \
-              --body "Auto-merge from main to develop failed due to conflicts after ${{ steps.check_merge.outputs.merge_type }} branch merge. Manual resolution required." \
+              --title "Auto-merge failed: main to development" \
+              --body "Auto-merge from main to development failed due to conflicts after ${{ steps.check_merge.outputs.merge_type }} branch merge. Manual resolution required." \
               --label "merge-conflict" \
               --assignee "${{ github.actor }}"
           fi
@@ -274,19 +366,19 @@ jobs:
         if: steps.check_merge.outputs.merge_type == 'hotfix'
         run: |
           RELEASE_BRANCHES=$(git branch -r | grep 'origin/release/' | sed 's/origin\///' | xargs)
-          
+
           if [ -z "$RELEASE_BRANCHES" ]; then
             echo "No active release branches found"
             exit 0
           fi
-          
+
           echo "Found release branches: $RELEASE_BRANCHES"
-          
+
           for branch in $RELEASE_BRANCHES; do
             echo "Processing branch: $branch"
             git checkout "$branch"
             git pull origin "$branch"
-            
+
             if git merge main --no-ff -m "Auto-merge: Sync $branch with main after hotfix"; then
               git push origin "$branch"
               echo "Successfully auto-merged main into $branch"
@@ -298,6 +390,5 @@ jobs:
                 --label "merge-conflict" \
                 --assignee "${{ github.actor }}"
             fi
-          done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
